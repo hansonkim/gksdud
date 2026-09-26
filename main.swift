@@ -267,6 +267,27 @@ struct PressGate {
     }
 }
 
+// System Settings can show gksdud as allowed while this process still cannot use it,
+// for example when another process started this copy directly. Time-based, so checks
+// from several triggers at the same moment do not escalate early.
+struct PressAccessRecovery {
+    static let settleDelay: TimeInterval = 2
+    static let tapDelay: TimeInterval = 3
+    private(set) var returned: TimeInterval?
+    private(set) var failingSince: TimeInterval?
+    mutating func observe(trusted: Bool) {
+        if trusted { returned = nil } else { failingSince = nil }
+    }
+    mutating func returnedFromSettings(now: TimeInterval) { returned = now }
+    mutating func tap(ready: Bool, now: TimeInterval) {
+        if ready { failingSince = nil } else if failingSince == nil { failingSince = now }
+    }
+    func needsRelaunch(trusted: Bool, now: TimeInterval) -> Bool {
+        guard let since = trusted ? failingSince : returned else { return false }
+        return now - since >= (trusted ? Self.tapDelay : Self.settleDelay)
+    }
+}
+
 // This is an explicit user-selected threshold, not a claimed macOS default.
 struct LongPressState {
     static let delay: TimeInterval = 0.5
@@ -413,16 +434,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var capsRestoreTasks: [DispatchWorkItem] = []
     let nativePulseMarker = Int64.random(in: 1...Int64.max)
     let pressAccess = NSButton(title: "접근성 권한 허용", target: nil, action: nil)
+    let pressHint = NSTextField(wrappingLabelWithString: "")
+    static let pressHintText = "버튼을 뗄 때가 아닌 누를 때 전환하도록 해 더 빠르게 전환합니다.\n글자 씹힘도 더 개선됩니다."
+    var pressAccessRecovery = PressAccessRecovery()
     let pressSwitch = NSButton(checkboxWithTitle: "누를 때 전환", target: nil, action: nil)
     let longPressSwitch = NSButton(checkboxWithTitle: "길게 눌러 대소문자 전환", target: nil, action: nil)
     let preserveCapsSwitch = NSButton(checkboxWithTitle: "한영 전환시 대소문자 보존", target: nil, action: nil)
     var permissionHighlightGeneration = 0
     var returningFromPermissionSettings = false
     var permissionSettingsWasActive = false
+    var permissionPromptAppeared = false
     func finishPermissionVisit() {
         guard returningFromPermissionSettings else { return }
         returningFromPermissionSettings = false
         permissionSettingsWasActive = false
+        pressAccessRecovery.returnedFromSettings(now: ProcessInfo.processInfo.systemUptime)
         ensureKeyTap()
         showSettings()
     }
@@ -435,7 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         selectTab(0)
         showSettings()
         updatePressAccess()
-        guard !AXIsProcessTrusted() else { return }
+        guard !AXIsProcessTrusted() || pressAccessNeedsRelaunch else { return }
         permissionHighlightGeneration += 1
         let generation = permissionHighlightGeneration
         pressAccess.wantsLayer = true
@@ -455,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
     }
     @objc func menuPressSwitch() {
-        guard AXIsProcessTrusted() else {
+        guard AXIsProcessTrusted(), !pressAccessNeedsRelaunch else {
             // Open after menu tracking has finished; don't toggle the saved preference.
             DispatchQueue.main.async { [weak self] in self?.highlightPressAccess() }
             return
@@ -473,12 +499,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if let tap = keyTap { CFMachPortInvalidate(tap) }
         keyTapSource = nil; keyTap = nil; pressGate.held.removeAll()
     }
+    var keyTapNeeded: Bool {
+        engine.active && (engine.switchOnKeyDown || engine.longPressCapsLock || engine.preserveCapsLock || specialMode != .none)
+    }
+    var keyTapReady: Bool { keyTap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
+    var pressAccessNeedsRelaunch: Bool {
+        pressAccessRecovery.needsRelaunch(trusted: AXIsProcessTrusted(), now: ProcessInfo.processInfo.systemUptime)
+    }
     func ensureKeyTap() {
-        guard AXIsProcessTrusted() else { stopKeyTap(); updatePressAccess(); return }
+        let trusted = AXIsProcessTrusted(), now = ProcessInfo.processInfo.systemUptime
+        pressAccessRecovery.observe(trusted: trusted)
+        guard trusted else { stopKeyTap(); updatePressAccess(); return }
         if let tap = keyTap, !CFMachPortIsValid(tap) { stopKeyTap() }
         syncCapsPreservation()
         if !engine.active || !engine.longPressCapsLock { cancelLongPress() }
-        guard engine.active, engine.switchOnKeyDown || engine.longPressCapsLock || engine.preserveCapsLock || specialMode != .none, keyTap == nil else { updatePressAccess(); return }
+        guard keyTapNeeded, keyTap == nil else {
+            pressAccessRecovery.tap(ready: !keyTapNeeded || keyTapReady, now: now)
+            updatePressAccess(); return
+        }
         let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue) | (CGEventMask(1) << CGEventType.keyUp.rawValue) | (CGEventMask(1) << CGEventType.flagsChanged.rawValue) | (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) | (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) | (CGEventMask(1) << CGEventType.otherMouseDown.rawValue)
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: { _, type, event, info in
@@ -537,18 +575,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     up.post(tap: .cghidEventTap)
                 }
                 return decision.consume ? nil : Unmanaged.passUnretained(event)
-            }, userInfo: Unmanaged.passUnretained(self).toOpaque()) else { updatePressAccess(); return }
+            }, userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
+            // Allowed in System Settings but refused here: retried each second, then offers a relaunch.
+            pressAccessRecovery.tap(ready: false, now: now)
+            updatePressAccess(); return
+        }
         keyTap = tap
         keyTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), keyTapSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        pressAccessRecovery.tap(ready: keyTapReady, now: now)
         updatePressAccess()
     }
     func updatePressAccess() {
         let trusted = AXIsProcessTrusted()
-        let ready = keyTap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false
-        pressAccess.title = trusted ? "권한 허용 완료" : "접근성 권한 허용"
-        pressAccess.isEnabled = !trusted
+        let ready = keyTapReady
+        let relaunch = pressAccessRecovery.needsRelaunch(trusted: trusted, now: ProcessInfo.processInfo.systemUptime)
+        pressAccess.title = relaunch ? "다시 실행" : trusted ? "권한 허용 완료" : "접근성 권한 허용"
+        pressAccess.action = relaunch ? #selector(relaunchForPressAccess) : #selector(requestPressAccess)
+        pressAccess.isEnabled = relaunch || !trusted
+        pressHint.stringValue = !relaunch ? Self.pressHintText
+            : (trusted ? "허용한 권한이 아직 적용되지 않았습니다. 다시 실행해주세요." : "시스템 설정에서 켰는데도 그대로라면 다시 실행해주세요.")
+                + "\n안 되면 손쉬운 사용 목록에서 −로 지운 뒤 다시 허용하세요."
+        pressHint.textColor = relaunch ? .systemOrange : .secondaryLabelColor
         pressSwitch.state = trusted && engine.switchOnKeyDown ? .on : .off
         pressSwitch.isEnabled = trusted
         longPressSwitch.state = trusted && engine.longPressCapsLock ? .on : .off
@@ -557,11 +606,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         preserveCapsSwitch.isEnabled = trusted
         preserveCapsSwitch.toolTip = "영어의 대소문자 상태를 기억해 한글에서 영어로 돌아올 때 복원합니다. 길게 누르기와 별도로 설정할 수 있습니다."
         longPressSwitch.toolTip = trusted ? "선택한 한영 키를 0.5초 누르면 영어로 전환하고 Caps Lock을 켜거나 끕니다." : "일반 탭의 접근성 권한 허용 버튼으로 권한을 허용해주세요."
-        pressAccess.toolTip = "키를 누르는 순간 전환하려면 접근성 권한이 필요합니다."
-        pressSwitch.toolTip = !trusted ? "오른쪽 버튼으로 접근성 권한을 허용해주세요. 허용 전에는 기존 방식으로 동작합니다." :
+        pressAccess.toolTip = relaunch ? "gksdud를 종료했다가 다시 실행해 허용한 권한을 적용합니다."
+            : "키를 누르는 순간 전환하려면 접근성 권한이 필요합니다."
+        pressSwitch.toolTip = relaunch ? "오른쪽 다시 실행 버튼으로 허용한 권한을 적용해주세요." :
+            !trusted ? "오른쪽 버튼으로 접근성 권한을 허용해주세요. 허용 전에는 기존 방식으로 동작합니다." :
             !engine.switchOnKeyDown ? "기존 macOS 단축키 방식으로 전환합니다." :
             !engine.active ? "활성화를 켜면 키를 누를 때 전환합니다." :
-            ready ? "키를 누르는 순간 전환 · 길게 눌러도 한 번만 전환" : "권한 반영을 기다리는 중입니다. 계속 전환되지 않으면 앱을 다시 실행하세요."
+            ready ? "키를 누르는 순간 전환 · 길게 눌러도 한 번만 전환" : "권한 반영을 기다리는 중입니다."
+    }
+    @objc func relaunchForPressAccess() { relaunch(showingSettings: true) }
+    // A new process gets a fresh permission check, and LaunchServices attributes it to gksdud itself.
+    func relaunch(showingSettings: Bool) {
+        let waiter: Process
+        do {
+            waiter = try AppRelauncher.waitThenRun(after: getpid(),
+                command: AppRelauncher.openCommand(Bundle.main.bundleURL, showingSettings: showingSettings))
+        } catch { report(error); return }
+        NSApp.terminate(nil)
+        // Still running: quitting was cancelled, so never start a second copy later.
+        waiter.terminate()
+    }
+    // The update helper starts this copy directly so it can supervise it. macOS attributes privacy
+    // checks, including Accessibility, to the process responsible for a copy started that way: the
+    // app that started the update, which has since quit. The grant in System Settings then may not
+    // apply. Once the helper is done, start again through LaunchServices, as Finder or login would.
+    func handOffUpdateLaunch() {
+        let helper = getppid()
+        guard helper > 1 else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            // Quitting while the helper still watches this copy would roll the update back.
+            guard getppid() != helper || ProcessInfo.processInfo.systemUptime >= deadline,
+                  !self.engine.isUpdatingSettings else { return }
+            timer.invalidate()
+            if AXIsProcessTrusted() && (self.keyTapReady || !self.keyTapNeeded) { return }
+            self.relaunch(showingSettings: false)
+        }
     }
     @objc func togglePressSwitch() {
         cancelLongPress()
@@ -700,9 +781,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func requestPressAccess() {
         returningFromPermissionSettings = true
         permissionSettingsWasActive = false
+        permissionPromptAppeared = false
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         // Let the system prompt offer Settings; do not open it before the user chooses.
         _ = AXIsProcessTrustedWithOptions(options)
+        // macOS prompts only while gksdud is not in the list yet. When no prompt took focus,
+        // the click would otherwise do nothing, so open the list directly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.returningFromPermissionSettings, !self.permissionSettingsWasActive,
+                  !self.permissionPromptAppeared, NSApp.isActive, !AXIsProcessTrusted() else { return }
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        }
+    }
+    func applicationDidResignActive(_ notification: Notification) {
+        if returningFromPermissionSettings { permissionPromptAppeared = true }
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         let mainMenu = NSMenu()
@@ -753,7 +845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if engine.active { do { try engine.shortcut(target: engine.target); try engine.hideSystemInputMenu() } catch { report(error) } }
         repair()
         if showInMenuBar.state == .off || CommandLine.arguments.contains("--settings") { showSettings() }
-        UpdateInstaller.acknowledgeLaunch()
+        if UpdateInstaller.acknowledgeLaunch() { handOffUpdateLaunch() }
     }
     func applicationDidBecomeActive(_ notification: Notification) {
         guard window != nil else { return }
@@ -919,7 +1011,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             case #selector(menuPressSwitch):
                 entry.state = AXIsProcessTrusted() && engine.switchOnKeyDown ? .on : .off
                 entry.isEnabled = true
-                entry.toolTip = AXIsProcessTrusted() ? "키를 누르는 순간 전환합니다." : "설정을 열어 접근성 권한 허용 버튼을 표시합니다."
+                entry.toolTip = pressAccessNeedsRelaunch ? "설정을 열어 다시 실행 버튼을 표시합니다."
+                    : AXIsProcessTrusted() ? "키를 누르는 순간 전환합니다." : "설정을 열어 접근성 권한 허용 버튼을 표시합니다."
             case #selector(menuLogin): entry.state = login.state
             case #selector(menuHidden): entry.state = showInMenuBar.state
             case #selector(selectKorean): entry.isEnabled = availableSource("ko") != nil
@@ -1143,6 +1236,22 @@ if CommandLine.arguments.dropFirst().first == "--install-update" {
     precondition(gate.handle(code: 90, down: true, repeatKey: false, active: true, target: 90).switchNow)
     precondition(gate.handle(code: 90, down: false, repeatKey: false, active: true, target: 90).consume)
     print("PASS: key-down switch, repeat suppression, release consumption, inactive pass-through, target change")
+    var access = PressAccessRecovery()
+    access.observe(trusted: false)
+    precondition(!access.needsRelaunch(trusted: false, now: 100), "A missing grant only asks for permission")
+    access.returnedFromSettings(now: 100)
+    precondition(!access.needsRelaunch(trusted: false, now: 101.9), "Allow a new grant time to apply")
+    precondition(access.needsRelaunch(trusted: false, now: 102), "Still refused after returning from Settings")
+    access.observe(trusted: true)
+    precondition(!access.needsRelaunch(trusted: true, now: 110) && access.returned == nil, "A grant that applies ends the visit")
+    for now in [110.0, 111, 112.9] { access.tap(ready: false, now: now) }
+    precondition(!access.needsRelaunch(trusted: true, now: 112.9), "Repeated checks must not escalate early")
+    precondition(access.needsRelaunch(trusted: true, now: 113), "Allowed, but this process cannot create the tap")
+    access.tap(ready: true, now: 114)
+    precondition(!access.needsRelaunch(trusted: true, now: 120), "A working tap clears the notice")
+    access.tap(ready: false, now: 130); access.observe(trusted: false)
+    precondition(!access.needsRelaunch(trusted: false, now: 140), "Revoked access asks for permission again")
+    print("PASS: permission return grace, allowed-but-unusable tap, early escalation guard, recovery, revocation")
     let suiteName = "io.gksdud.inputswitch.defaults-test.\(UUID().uuidString)"
     let suite = UserDefaults(suiteName: suiteName)!
     let preferences = Engine(defaults: suite)

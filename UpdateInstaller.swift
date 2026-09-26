@@ -314,10 +314,40 @@ final class UpdateInstaller: @unchecked Sendable {
             (try? String(contentsOf: receipt, encoding: .utf8)) == String($0.processIdentifier)
         }
     }
-    static func acknowledgeLaunch() {
-        guard let path = ProcessInfo.processInfo.environment["GKSDUD_UPDATE_READY"] else { return }
+    // True when an update helper started this copy directly and is waiting for this receipt.
+    @discardableResult static func acknowledgeLaunch() -> Bool {
+        guard let path = ProcessInfo.processInfo.environment["GKSDUD_UPDATE_READY"] else { return false }
+        // Only this launch answers the helper; `open` would pass it on to a relaunched copy.
+        unsetenv("GKSDUD_UPDATE_READY")
         let url = URL(fileURLWithPath: path)
-        guard url.lastPathComponent == "ready", url.deletingLastPathComponent().lastPathComponent.hasPrefix("gksdud-launch-") else { return }
-        try? String(getpid()).write(to: url, atomically: true, encoding: .utf8)
+        guard url.lastPathComponent == "ready", url.deletingLastPathComponent().lastPathComponent.hasPrefix("gksdud-launch-") else { return false }
+        return (try? String(getpid()).write(to: url, atomically: true, encoding: .utf8)) != nil
+    }
+}
+
+// Starts the command only after the given process has exited, so two copies never manage
+// the same mappings. The time limit keeps a cancelled quit from starting a copy much later.
+enum AppRelauncher {
+    static let script = """
+        pid=$1; limit=$2; shift 2; i=0
+        while kill -0 "$pid" 2>/dev/null; do
+          i=$((i + 1)); [ "$i" -gt "$limit" ] && exit 1
+          /bin/sleep 0.1
+        done
+        /bin/sleep 0.5
+        exec "$@"
+        """
+    // limit counts 0.1-second checks; 60 seconds matches the update helper's wait for the old app.
+    static func waitThenRun(after pid: pid_t, command: [String], limit: Int = 600) throws -> Process {
+        let waiter = Process()
+        waiter.executableURL = URL(fileURLWithPath: "/bin/sh")
+        waiter.arguments = ["-c", script, "gksdud-relaunch", String(pid), String(limit)] + command
+        waiter.standardOutput = FileHandle.nullDevice; waiter.standardError = FileHandle.nullDevice
+        try waiter.run()
+        return waiter
+    }
+    // Without -n, LaunchServices never starts a second copy next to a running one.
+    static func openCommand(_ bundle: URL, showingSettings: Bool) -> [String] {
+        ["/usr/bin/open"] + (showingSettings ? [bundle.path, "--args", "--settings"] : ["-g", bundle.path])
     }
 }

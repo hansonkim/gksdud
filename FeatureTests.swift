@@ -458,6 +458,26 @@ func runUpdateInstallTests() throws {
     }
     featureCheck(rollbackSawDeadChild, "Old app relaunch waits for timed-out child termination")
     print("PASS: launch readiness, early exit, timeout termination, SIGKILL fallback, child exit before rollback")
+    // Real waiter script: a harmless command stands in for LaunchServices.
+    let app = URL(fileURLWithPath: "/Applications/gksdud.app")
+    featureCheck(AppRelauncher.openCommand(app, showingSettings: false) == ["/usr/bin/open", "-g", app.path])
+    featureCheck(AppRelauncher.openCommand(app, showingSettings: true) == ["/usr/bin/open", app.path, "--args", "--settings"])
+    let relaunched = root.appendingPathComponent("relaunched"), abandoned = root.appendingPathComponent("abandoned")
+    let quitting = Process(); quitting.executableURL = URL(fileURLWithPath: "/bin/sleep"); quitting.arguments = ["30"]
+    try quitting.run()
+    let waiter = try AppRelauncher.waitThenRun(after: quitting.processIdentifier, command: ["/usr/bin/touch", relaunched.path])
+    // Past the post-exit pause, so only waiting for the process explains the missing file.
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.7))
+    featureCheck(waiter.isRunning && !fm.fileExists(atPath: relaunched.path), "Never start a copy while the app is still running")
+    quitting.terminate(); quitting.waitUntilExit(); waiter.waitUntilExit()
+    featureCheck(waiter.terminationStatus == 0 && fm.fileExists(atPath: relaunched.path), "Start the new copy after the app exits")
+    let cancelled = Process(); cancelled.executableURL = URL(fileURLWithPath: "/bin/sleep"); cancelled.arguments = ["5"]
+    try cancelled.run()
+    let expired = try AppRelauncher.waitThenRun(after: cancelled.processIdentifier, command: ["/usr/bin/touch", abandoned.path], limit: 2)
+    expired.waitUntilExit()
+    featureCheck(expired.terminationStatus == 1 && !fm.fileExists(atPath: abandoned.path), "A quit that never finishes must not start a copy later")
+    cancelled.terminate(); cancelled.waitUntilExit()
+    print("PASS: relaunch waits for exit, opens through LaunchServices without a second copy, gives up on a cancelled quit")
     print("PASS: archive checksums/paths/link and size rejection, release asset origin, validation before replacement, move/launch rollback, successful replacement")
 }
 

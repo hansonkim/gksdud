@@ -67,8 +67,8 @@ extension AppDelegate {
             tabs.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -5),
             tabs.heightAnchor.constraint(equalToConstant: 42)
         ])
-        func hint(_ text: String, in panel: NSStackView, indent: CGFloat = 20) {
-            let label = NSTextField(wrappingLabelWithString: text)
+        func hint(_ text: String, in panel: NSStackView, indent: CGFloat = 20, label: NSTextField = NSTextField(wrappingLabelWithString: "")) {
+            label.stringValue = text
             label.font = .systemFont(ofSize: 11); label.textColor = .secondaryLabelColor
             label.translatesAutoresizingMaskIntoConstraints = false
             let container = NSView(); container.addSubview(label)
@@ -97,7 +97,8 @@ extension AppDelegate {
         pressAccess.target = self; pressAccess.action = #selector(requestPressAccess); pressAccess.bezelStyle = .rounded
         let pressRow = NSStackView(views: [pressSwitch, pressAccess]); pressRow.spacing = 16; pressRow.alignment = .centerY
         general.addArrangedSubview(pressRow)
-        hint("버튼을 뗄 때가 아닌 누를 때 전환하도록 해 더 빠르게 전환합니다.\n글자 씹힘도 더 개선됩니다.", in: general)
+        // updatePressAccess replaces this with a relaunch notice while a grant is not applied.
+        hint(Self.pressHintText, in: general, label: pressHint)
         separator(in: general)
         picker.addItems(withTitles: ["우측 Command ⌘", "우측 Option ⌥", "Caps Lock ⇪"])
         picker.selectItem(at: sources.firstIndex(of: engine.source) ?? 0)
