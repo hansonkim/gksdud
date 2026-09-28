@@ -204,9 +204,12 @@ final class Engine {
         keyboards.reconcile(source: source, target: target.usage, active: active).applied
     }
     func restore() throws {
+        defaults.set(false, forKey: "active")
+        try restoreSystemSettings()
+    }
+    private func restoreSystemSettings() throws {
         settingsUpdateDepth += 1
         defer { settingsUpdateDepth -= 1 }
-        defaults.set(false, forKey: "active")
         let mappingResult = keyboards.reconcile(source: source, target: target.usage, active: false)
         // A failed quit must not restore the shortcut while some keys still emit our target.
         if mappingResult.pending > 0 { throw KeyboardError.verification }
@@ -242,10 +245,10 @@ final class Engine {
         else { try restore() }
     }
     func prepareForExit() throws {
-        let resumeOnLaunch = active
         // Cleanup affects macOS, not the user's saved activation choice, even if quit is cancelled.
-        defer { defaults.set(resumeOnLaunch, forKey: "active"); defaults.synchronize() }
-        try restore()
+        // Never store an interim inactive state: logout can SIGTERM the app mid-cleanup.
+        defer { defaults.synchronize() }
+        try restoreSystemSettings()
     }
     func restoreMappings() throws {
         let result = keyboards.reconcile(source: source, target: target.usage, active: false)

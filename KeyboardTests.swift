@@ -68,11 +68,13 @@ func runShortcutRestoreTests() throws {
     var keys: [String: Any] = ["61": otherEntry]
     var failWrite = false, failActivation = false
     var activations = 0
+    var activeWhenActivated: Bool?
     let store = ShortcutPreferences(read: { keys }, write: { value in
         if failWrite { throw KeyboardError.write }
         keys = value
     }, activate: {
         activations += 1
+        activeWhenActivated = defaults.object(forKey: "active") as? Bool
         if failActivation { throw KeyboardError.verification }
     })
     let engine = Engine(defaults: defaults, discover: { [] }, shortcutPreferences: store)
@@ -137,7 +139,14 @@ func runShortcutRestoreTests() throws {
     let before = activations
     try engine.restore()
     precondition(activations == before + 1 && !defaults.bool(forKey: "shortcutBackedUp"), "Retry failed activation before clearing the backup")
-    print("PASS: normalized F-key shortcut restoration, disabled/missing baselines, user edits, target changes, legacy backups, restore retry")
+
+    // Logout can SIGTERM the app while quit cleanup waits for activateSettings; relaunch reads what was saved then.
+    defaults.set(true, forKey: "active")
+    try engine.shortcut(target: targets[6])
+    activeWhenActivated = nil
+    try engine.prepareForExit()
+    precondition(activeWhenActivated == true && engine.active, "Quit cleanup must never save an interim inactive state")
+    print("PASS: normalized F-key shortcut restoration, disabled/missing baselines, user edits, target changes, legacy backups, restore retry, quit cleanup keeps activation saved")
 }
 
 final class TestKeyboard: KeyboardDevice {
